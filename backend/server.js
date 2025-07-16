@@ -3,6 +3,8 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
@@ -13,10 +15,22 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
+// Create uploads directory if it doesn't exist
+const fs = require('fs');
+if (!fs.existsSync('uploads')) {
+  fs.mkdirSync('uploads');
+}
+
 // MongoDB connection
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/articleplatform', {
   useNewUrlParser: true,
   useUnifiedTopology: true,
+});
+
+const db = mongoose.connection;
+db.on('error', console.error.bind(console, 'MongoDB connection error:'));
+db.once('open', () => {
+  console.log('Connected to MongoDB');
 });
 
 // Article Schema
@@ -49,11 +63,25 @@ const storage = multer.diskStorage({
     cb(null, 'uploads/');
   },
   filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + file.originalname);
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
   }
 });
 
-const upload = multer({ storage: storage });
+const upload = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Check file type
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed!'), false);
+    }
+  }
+});
 
 // Auto-tagging function
 const generateTags = (content) => {
@@ -79,7 +107,30 @@ const generateTags = (content) => {
   return tags.length > 0 ? tags : ['general'];
 };
 
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key', (err, user) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
 // Routes
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ message: 'Backend is running!', timestamp: new Date().toISOString() });
+});
 
 // Get all articles
 app.get('/api/articles', async (req, res) => {
@@ -87,7 +138,8 @@ app.get('/api/articles', async (req, res) => {
     const articles = await Article.find().sort({ createdAt: -1 });
     res.json(articles);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching articles:', error);
+    res.status(500).json({ message: 'Error fetching articles', error: error.message });
   }
 });
 
@@ -100,7 +152,8 @@ app.get('/api/articles/:id', async (req, res) => {
     }
     res.json(article);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error fetching article:', error);
+    res.status(500).json({ message: 'Error fetching article', error: error.message });
   }
 });
 
@@ -109,22 +162,28 @@ app.post('/api/articles', upload.single('image'), async (req, res) => {
   try {
     const { title, content, author } = req.body;
     
+    if (!title || !content || !author) {
+      return res.status(400).json({ message: 'Title, content, and author are required' });
+    }
+    
     const tags = generateTags(content);
     const excerpt = content.replace(/[*#]/g, '').substring(0, 150) + '...';
     
     const article = new Article({
-      title,
-      content,
-      author,
+      title: title.trim(),
+      content: content.trim(),
+      author: author.trim(),
       tags,
       excerpt,
       image: req.file ? `/uploads/${req.file.filename}` : undefined
     });
 
     const savedArticle = await article.save();
+    console.log('Article created:', savedArticle._id);
     res.status(201).json(savedArticle);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    console.error('Error creating article:', error);
+    res.status(400).json({ message: 'Error creating article', error: error.message });
   }
 });
 
@@ -134,9 +193,9 @@ app.put('/api/articles/:id', upload.single('image'), async (req, res) => {
     const { title, content, author } = req.body;
     
     const updateData = {
-      title,
-      content,
-      author,
+      title: title.trim(),
+      content: content.trim(),
+      author: author.trim(),
       tags: generateTags(content),
       excerpt: content.replace(/[*#]/g, '').substring(0, 150) + '...',
       updatedAt: new Date()
@@ -156,9 +215,11 @@ app.put('/api/articles/:id', upload.single('image'), async (req, res) => {
       return res.status(404).json({ message: 'Article not found' });
     }
 
+    console.log('Article updated:', article._id);
     res.json(article);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    console.error('Error updating article:', error);
+    res.status(400).json({ message: 'Error updating article', error: error.message });
   }
 });
 
@@ -169,9 +230,20 @@ app.delete('/api/articles/:id', async (req, res) => {
     if (!article) {
       return res.status(404).json({ message: 'Article not found' });
     }
+    
+    // Delete associated image file if exists
+    if (article.image) {
+      const imagePath = path.join(__dirname, article.image);
+      fs.unlink(imagePath, (err) => {
+        if (err) console.error('Error deleting image file:', err);
+      });
+    }
+    
+    console.log('Article deleted:', req.params.id);
     res.json({ message: 'Article deleted successfully' });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error deleting article:', error);
+    res.status(500).json({ message: 'Error deleting article', error: error.message });
   }
 });
 
@@ -180,26 +252,32 @@ app.post('/api/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
     
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Name, email, and password are required' });
+    }
+    
     // Check if user already exists
-    const existingUser = await User.findOne({ email });
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
     if (existingUser) {
-      return res.status(400).json({ message: 'User already exists' });
+      return res.status(400).json({ message: 'User already exists with this email' });
     }
 
     // Hash password
-    const bcrypt = require('bcryptjs');
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
 
     const user = new User({
-      name,
-      email,
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
       password: hashedPassword
     });
 
     await user.save();
+    console.log('User registered:', user.email);
     res.status(201).json({ message: 'User created successfully' });
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    console.error('Error registering user:', error);
+    res.status(400).json({ message: 'Error creating user', error: error.message });
   }
 });
 
@@ -208,27 +286,30 @@ app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password are required' });
+    }
+    
     // Find user
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
-      return res.status(400).json({ message: 'Invalid credentials' });
+      return res.status(400).json({ message: 'Invalid email or password' });
     }
 
     // Check password
-    const bcrypt = require('bcryptjs');
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
-      return res.status(400).json({ message: 'Invalid credentials' });
+      return res.status(400).json({ message: 'Invalid email or password' });
     }
 
     // Generate JWT token
-    const jwt = require('jsonwebtoken');
     const token = jwt.sign(
-      { userId: user._id },
+      { userId: user._id, email: user.email },
       process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '24h' }
     );
 
+    console.log('User logged in:', user.email);
     res.json({
       token,
       user: {
@@ -238,11 +319,45 @@ app.post('/api/login', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Error logging in user:', error);
+    res.status(500).json({ message: 'Error logging in', error: error.message });
   }
+});
+
+// Get user profile (protected route)
+app.get('/api/profile', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId).select('-password');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json(user);
+  } catch (error) {
+    console.error('Error fetching profile:', error);
+    res.status(500).json({ message: 'Error fetching profile', error: error.message });
+  }
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ message: 'File too large. Maximum size is 5MB.' });
+    }
+  }
+  
+  console.error('Unhandled error:', error);
+  res.status(500).json({ message: 'Internal server error', error: error.message });
+});
+
+// Handle 404 routes
+app.use('*', (req, res) => {
+  res.status(404).json({ message: 'Route not found' });
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+  console.log(`📝 Articles API: http://localhost:${PORT}/api/articles`);
 });
